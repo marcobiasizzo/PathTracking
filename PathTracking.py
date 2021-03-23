@@ -11,6 +11,29 @@ from sensor_msgs.msg import JointState
 import time
 from std_srvs.srv import Empty
 
+import PySimpleGUI as sg
+import threading
+
+text = "g = "
+
+def gui():
+    global text
+    sg.theme('Default1') 
+    layout = [  [sg.Text(text,font='Courier 100', key='text')] ]
+    
+
+    window = sg.Window('g value', layout)
+
+    while True:
+        
+        event, values = window.read(timeout=10)
+        window['text'].update(text)
+        if event == sg.WIN_CLOSED or event == 'Cancel': # if user closes window or clicks cancel
+            break
+
+    
+    window.close()
+
 
 class Urdf2Moon:
     def __init__(self, urdf_path, root, tip):
@@ -28,6 +51,8 @@ class Urdf2Moon:
         self.fk_dict = self.robot_parser.get_forward_kinematics(self.root, self.tip)
         self.T_fk = self.fk_dict["T_fk"]
         self.J = cs.jacobian(self.T_fk(self.q)[0:3:2,3], self.q)
+        
+        self.g = cs.SX.sym("g")
         
     def define_symbolic_vars(self, num_joints):
         q = cs.SX.sym("q", num_joints)
@@ -47,7 +72,7 @@ class Urdf2Moon:
         # load inertia terms (function)
         M_sym = self.robot_parser.get_inertia_matrix_crba(root, tip)
         # load gravity terms (function)
-        gravity_u2c = [0, 0, -9.81]
+        gravity_u2c = [0, 0, -1]
         G_sym = self.robot_parser.get_gravity_rnea(root, tip, gravity_u2c)
         # load Coriolis terms (function)
         C_sym = self.robot_parser.get_coriolis_rnea(root, tip)
@@ -68,38 +93,49 @@ class Urdf2Moon:
         S_func = cs.Function('S_func', [self.epsilon], [S], ["epsilon"], ["S"])
         self.S_q = S_func(epsilon_q)
     def evaluate_tau_function(self, alpha, ni, Kb):
-        gamma = -cs.pinv(self.J)@((self.C_epsilon_q@self.C_q.T*ni).T + self.S_q*alpha)
-        gamma_epsilon = cs.jacobian(gamma, self.q)
+        self.gamma = -cs.pinv(self.J)@((self.C_epsilon_q@self.C_q.T*ni).T + self.S_q*alpha)
+        gamma_epsilon = cs.jacobian(self.gamma, self.q)
         gamma_dot = gamma_epsilon@self.q_dot
-        a = self.Cq(self.q, self.q_dot) + self.G(self.q)  
-        p = (cs.pinv(self.q_dot-gamma)@(self.C_q.T*self.C_epsilon_q@
+        a = self.Cq(self.q, self.q_dot) + self.G(self.q)*self.g
+        p = (cs.pinv(self.q_dot-self.gamma)@(self.C_q.T*self.C_epsilon_q@
                                         (self.J@self.q_dot+self.C_epsilon_q.T*self.C_q*ni))).T
-        b = gamma_dot - p - Kb*(self.q_dot-gamma)
+        b = gamma_dot - p - Kb*(self.q_dot-self.gamma)
         tau = a + self.M(self.q)@b
-        self.tau_func = cs.Function("tau_func", [self.q, self.q_dot], [tau], ["q", "q_dot"], ["tau"])
+        self.tau_func = cs.Function("tau_func", [self.q, self.q_dot, self.g], [tau], ["q", "q_dot", "g"], ["tau"])
+    def evaluate_u_pi_function(self, dt, R):
+        u_pi = - 1/R * (cs.pinv(self.M(self.q))@ self.G(self.q)).T@(self.q_dot - self.gamma)
+        self.u_pi_func = cs.Function("u_pi_func", [self.q, self.q_dot], [u_pi], ["q", "q_dot"], ["u_pi"])
 
         
 if __name__ == '__main__':
-    urdf_path = "urdf/rrbot.urdf"
+    urdf_path = "/home/marco/rrbot_computed_torque/src/path_tracking/src/urdf/rrbot.urdf"
     root = "link1" 
     end = "link4"
     
     # define a custom track in xy plane
-    x0 = 0.2
-    y0 = 0.2
-    R = 0.1
+    x0 = -1.0 # 0.0 - 0.7853 # 0.0 # -1.0
+    y0 = 2.0 # 2.0 - 0.7853 # 1.0 # 2.0 
+    R = 0.5
+    theta = 0.7853
+    
     def C_function(x, y):
         return (x - x0)**2 + (y - y0)**2 - R**2
+        # return (x - x0 + np.cos(theta))**2 + (y - y0 + np.sin(theta))**2 - R**2
+        # return (x**2 + y**2)**2 - a * (x**2 - y**2)
 
     model = Urdf2Moon(urdf_path, root, end)
     model.load_path(C_function)
     
-    # parameters
-    ni = 0.5
-    alpha = 0.1
-    Kb = 1.0
-    model.evaluate_tau_function(alpha, ni, Kb)
+    RATE = 100
     
+    # parameters
+    ni = 5
+    alpha = 2
+    Kb = 10.0
+    dt = 1.0/RATE
+    R = 1
+    model.evaluate_tau_function(alpha, ni, Kb)
+    model.evaluate_u_pi_function(dt, R)    
 
     # Init the node
     rospy.init_node('computed_torque')
@@ -125,15 +161,34 @@ if __name__ == '__main__':
     rospy.Subscriber('/rrbot/joint_states', JointState, callback)
 
     time.sleep(1.5)
-    r = rospy.Rate(20)
+    
+    r = rospy.Rate(RATE)
     
     _ = input("Press Enter to continue...")
     unpause_physics()
     rospy.sleep(0.1)
+    g = 5
+    limit = 0.1
+    
+    x = threading.Thread(target=gui)
+    x.start()
 
     while not rospy.is_shutdown():
+    
+        rospy.loginfo(g)
         
-        tau_val = model.tau_func(q, q_dot)
+        tau_val = model.tau_func(q, q_dot, g)
+        g_dot = model.u_pi_func(q, q_dot)
+        rospy.loginfo(g_dot)
+        delta_g = g_dot*dt
+        if delta_g < -limit:
+            g -= limit
+        elif delta_g > limit:
+            g += limit
+        else: 
+            g += delta_g  
+            
+        text = str(g)      
         
         motor1.publish(tau_val[0])
         motor2.publish(tau_val[1])
